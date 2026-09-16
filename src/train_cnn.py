@@ -80,18 +80,23 @@ if __name__ == "__main__":
 
     print("\nLoading datasets...")
 
+    # Training actors: 1-16
+    # No augmentation for this experiment
     train_dataset = MelSpectrogramDataset(
         FEATURES_PATH,
         LABELS_PATH,
         actors=range(1, 17),
+        augment=False,
     )
 
+    # Validation actors: 17-20
     val_dataset = MelSpectrogramDataset(
         FEATURES_PATH,
         LABELS_PATH,
         actors=range(17, 21),
     )
 
+    # Test actors: 21-24
     test_dataset = MelSpectrogramDataset(
         FEATURES_PATH,
         LABELS_PATH,
@@ -166,13 +171,6 @@ if __name__ == "__main__":
         lr=LEARNING_RATE,
     )
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="max",
-        factor=0.5,
-        patience=3,
-    )
-
     # --------------------------------------------------
     # Training history
     # --------------------------------------------------
@@ -219,7 +217,7 @@ if __name__ == "__main__":
                 non_blocking=True,
             )
 
-            # Clear gradients
+            # Clear previous gradients
             optimizer.zero_grad()
 
             # Forward pass
@@ -234,10 +232,13 @@ if __name__ == "__main__":
             # Backpropagation
             loss.backward()
 
-            # Update weights
+            # Update model weights
             optimizer.step()
 
-            # Statistics
+            # ------------------------------------------
+            # Training statistics
+            # ------------------------------------------
+
             running_loss += (
                 loss.item()
                 * inputs.size(0)
@@ -287,8 +288,10 @@ if __name__ == "__main__":
                     non_blocking=True,
                 )
 
+                # Forward pass
                 outputs = model(inputs)
 
+                # Validation loss
                 loss = criterion(
                     outputs,
                     labels,
@@ -299,6 +302,7 @@ if __name__ == "__main__":
                     * inputs.size(0)
                 )
 
+                # Predictions
                 predictions = outputs.argmax(
                     dim=1
                 )
@@ -318,11 +322,9 @@ if __name__ == "__main__":
         val_accuracy = (
             val_correct / val_total
         )
-        
-        scheduler.step(val_accuracy)
 
         # --------------------------------------------------
-        # Save history
+        # Store history
         # --------------------------------------------------
 
         train_losses.append(
@@ -369,12 +371,9 @@ if __name__ == "__main__":
         # Print epoch results
         # --------------------------------------------------
 
-        current_lr = optimizer.param_groups[0]["lr"]
-
         print(
             f"Epoch "
             f"{epoch + 1:02d}/{NUM_EPOCHS} | "
-            f"LR: {current_lr:.6f} | "
             f"Train Loss: {train_loss:.4f} | "
             f"Train Acc: {train_accuracy:.4f} | "
             f"Val Loss: {val_loss:.4f} | "
@@ -425,8 +424,10 @@ if __name__ == "__main__":
                 non_blocking=True,
             )
 
+            # Forward pass
             outputs = model(inputs)
 
+            # Predictions
             predictions = outputs.argmax(
                 dim=1
             )
@@ -450,6 +451,10 @@ if __name__ == "__main__":
     test_accuracy = (
         test_correct / test_total
     )
+
+    # ==================================================
+    # Final results
+    # ==================================================
 
     print(
         f"\nBest Validation Accuracy: "

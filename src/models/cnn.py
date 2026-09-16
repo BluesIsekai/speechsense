@@ -14,42 +14,77 @@ class SpeechEmotionCNN(nn.Module):
 
         self.features = nn.Sequential(
 
+            # ==============================================
             # Block 1
+            # ==============================================
+
             nn.Conv2d(
                 in_channels=1,
                 out_channels=32,
                 kernel_size=3,
                 padding=1,
             ),
+
             nn.BatchNorm2d(32),
+
             nn.ReLU(),
+
             nn.MaxPool2d(2),
 
+            # ==============================================
             # Block 2
+            # ==============================================
+
             nn.Conv2d(
                 in_channels=32,
                 out_channels=64,
                 kernel_size=3,
                 padding=1,
             ),
+
             nn.BatchNorm2d(64),
+
             nn.ReLU(),
+
             nn.MaxPool2d(2),
 
+            # ==============================================
             # Block 3
+            # ==============================================
+
             nn.Conv2d(
                 in_channels=64,
                 out_channels=128,
                 kernel_size=3,
                 padding=1,
             ),
+
             nn.BatchNorm2d(128),
+
             nn.ReLU(),
+
+            nn.MaxPool2d(2),
+
+            # ==============================================
+            # Block 4
+            # ==============================================
+
+            nn.Conv2d(
+                in_channels=128,
+                out_channels=256,
+                kernel_size=3,
+                padding=1,
+            ),
+
+            nn.BatchNorm2d(256),
+
+            nn.ReLU(),
+
             nn.MaxPool2d(2),
         )
 
         # --------------------------------------------------
-        # Global average pooling
+        # Global Average Pooling
         # --------------------------------------------------
 
         self.pool = nn.AdaptiveAvgPool2d(
@@ -64,6 +99,15 @@ class SpeechEmotionCNN(nn.Module):
 
             nn.Flatten(),
 
+            nn.Dropout(0.4),
+
+            nn.Linear(
+                256,
+                128,
+            ),
+
+            nn.ReLU(),
+
             nn.Dropout(0.3),
 
             nn.Linear(
@@ -71,6 +115,10 @@ class SpeechEmotionCNN(nn.Module):
                 num_classes,
             ),
         )
+
+    # --------------------------------------------------
+    # Forward pass
+    # --------------------------------------------------
 
     def forward(self, x):
 
@@ -83,9 +131,9 @@ class SpeechEmotionCNN(nn.Module):
         return x
 
 
-# --------------------------------------------------
+# ==================================================
 # Test model
-# --------------------------------------------------
+# ==================================================
 
 if __name__ == "__main__":
 
@@ -93,7 +141,7 @@ if __name__ == "__main__":
 
     print(model)
 
-    # Fake batch matching our actual data
+    # Fake batch matching our data
     x = torch.randn(
         32,
         1,
