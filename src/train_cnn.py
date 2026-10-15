@@ -1,48 +1,110 @@
+
 import os
+import csv
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.metrics import f1_score
 from torch.utils.data import DataLoader
 
 from data.mel_dataset import MelSpectrogramDataset
-from models.cnn import SpeechEmotionCNN
+from models.cnn_depthwise import SpeechEmotionCNN
 
 
 # ==================================================
 # Configuration
 # ==================================================
 
-FEATURES_PATH = (
-    "data/processed/mel_spectrograms.npy"
-)
+FEATURES_PATH = "data/processed/mel_spectrograms.npy"
+LABELS_PATH = "data/processed/mel_labels.csv"
 
-LABELS_PATH = (
-    "data/processed/mel_labels.csv"
-)
-
+# Separate checkpoint: preserve the previous best model.
 MODEL_PATH = (
-    "data/processed/best_cnn.pth"
+    "data/processed/"
+    "best_cnn_depthwise_l2_1e3_earlystop.pth"
+)
+
+HISTORY_PATH = (
+    "data/processed/"
+    "history_cnn_depthwise_l2_1e3_earlystop.csv"
 )
 
 BATCH_SIZE = 32
 NUM_EPOCHS = 30
 LEARNING_RATE = 0.001
-
+WEIGHT_DECAY = 1e-3
 NUM_CLASSES = 8
+
+PATIENCE = 7
+MIN_DELTA = 1e-4
 
 
 # ==================================================
 # Device
 # ==================================================
 
-if torch.cuda.is_available():
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
 
-    DEVICE = torch.device("cuda")
 
-else:
+# ==================================================
+# Evaluation helper
+# ==================================================
 
-    DEVICE = torch.device("cpu")
+def evaluate(model, loader, criterion):
+    model.eval()
+
+    running_loss = 0.0
+    total = 0
+    predictions_all = []
+    labels_all = []
+
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs = inputs.to(
+                DEVICE, non_blocking=True
+            )
+            labels = labels.to(
+                DEVICE, non_blocking=True
+            )
+
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+
+            predictions = outputs.argmax(dim=1)
+
+            running_loss += loss.item() * labels.size(0)
+            total += labels.size(0)
+
+            predictions_all.extend(
+                predictions.cpu().numpy()
+            )
+            labels_all.extend(labels.cpu().numpy())
+
+    avg_loss = running_loss / total
+    accuracy = np.mean(
+        np.asarray(predictions_all)
+        == np.asarray(labels_all)
+    )
+
+    macro_f1 = f1_score(
+        labels_all,
+        predictions_all,
+        labels=list(range(NUM_CLASSES)),
+        average="macro",
+        zero_division=0,
+    )
+
+    return (
+        avg_loss,
+        accuracy,
+        macro_f1,
+        predictions_all,
+        labels_all,
+    )
 
 
 # ==================================================
@@ -52,27 +114,14 @@ else:
 if __name__ == "__main__":
 
     print("=" * 60)
-    print("SpeechSense CNN Training")
+    print("SpeechSense Depthwise CNN Training")
     print("=" * 60)
 
-    # --------------------------------------------------
-    # Device information
-    # --------------------------------------------------
-
-    print("\nDevice:")
-    print(DEVICE)
+    print(f"\nDevice: {DEVICE}")
 
     if torch.cuda.is_available():
-
-        print(
-            "GPU:",
-            torch.cuda.get_device_name(0)
-        )
-
-        print(
-            "CUDA:",
-            torch.version.cuda
-        )
+        print("GPU:", torch.cuda.get_device_name(0))
+        print("CUDA:", torch.version.cuda)
 
     # --------------------------------------------------
     # Load datasets
@@ -80,8 +129,6 @@ if __name__ == "__main__":
 
     print("\nLoading datasets...")
 
-    # Training actors: 1-16
-    # No augmentation for this experiment
     train_dataset = MelSpectrogramDataset(
         FEATURES_PATH,
         LABELS_PATH,
@@ -89,35 +136,21 @@ if __name__ == "__main__":
         augment=False,
     )
 
-    # Validation actors: 17-20
     val_dataset = MelSpectrogramDataset(
         FEATURES_PATH,
         LABELS_PATH,
         actors=range(17, 21),
     )
 
-    # Test actors: 21-24
     test_dataset = MelSpectrogramDataset(
         FEATURES_PATH,
         LABELS_PATH,
         actors=range(21, 25),
     )
 
-    print(
-        f"Training samples:   {len(train_dataset)}"
-    )
-
-    print(
-        f"Validation samples: {len(val_dataset)}"
-    )
-
-    print(
-        f"Test samples:       {len(test_dataset)}"
-    )
-
-    # --------------------------------------------------
-    # DataLoaders
-    # --------------------------------------------------
+    print(f"Training samples:   {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
+    print(f"Test samples:       {len(test_dataset)}")
 
     train_loader = DataLoader(
         train_dataset,
@@ -144,249 +177,176 @@ if __name__ == "__main__":
     )
 
     # --------------------------------------------------
-    # Create model
+    # Model and optimizer
     # --------------------------------------------------
 
     model = SpeechEmotionCNN(
         num_classes=NUM_CLASSES
-    )
-
-    model = model.to(DEVICE)
-
-    print("\nModel:")
-    print(model)
-
-    # --------------------------------------------------
-    # Loss function
-    # --------------------------------------------------
+    ).to(DEVICE)
 
     criterion = nn.CrossEntropyLoss()
-
-    # --------------------------------------------------
-    # Optimizer
-    # --------------------------------------------------
 
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
     )
+
+    print(f"\nWeight decay: {WEIGHT_DECAY}")
+    print(f"Early stopping patience: {PATIENCE}")
+    print("Checkpoint selection: validation loss")
+
+    os.makedirs("data/processed", exist_ok=True)
 
     # --------------------------------------------------
     # Training history
     # --------------------------------------------------
 
-    train_losses = []
-    val_losses = []
+    history = []
 
-    train_accuracies = []
-    val_accuracies = []
-
+    best_val_loss = float("inf")
     best_val_accuracy = 0.0
+    best_val_f1 = -1.0
+    best_epoch = 0
+    epochs_without_improvement = 0
 
     # --------------------------------------------------
     # Training loop
     # --------------------------------------------------
 
-    print("\n")
-    print("=" * 60)
+    print("\n" + "=" * 60)
     print("Starting Training")
     print("=" * 60)
 
     for epoch in range(NUM_EPOCHS):
 
-        # ==============================================
-        # Training
-        # ==============================================
-
         model.train()
 
-        running_loss = 0.0
-        correct = 0
-        total = 0
+        train_running_loss = 0.0
+        train_correct = 0
+        train_total = 0
 
         for inputs, labels in train_loader:
 
-            # Move data to GPU
             inputs = inputs.to(
-                DEVICE,
-                non_blocking=True,
+                DEVICE, non_blocking=True
             )
-
             labels = labels.to(
-                DEVICE,
-                non_blocking=True,
+                DEVICE, non_blocking=True
             )
 
-            # Clear previous gradients
             optimizer.zero_grad()
 
-            # Forward pass
             outputs = model(inputs)
+            loss = criterion(outputs, labels)
 
-            # Calculate loss
-            loss = criterion(
-                outputs,
-                labels,
-            )
-
-            # Backpropagation
             loss.backward()
-
-            # Update model weights
             optimizer.step()
 
-            # ------------------------------------------
-            # Training statistics
-            # ------------------------------------------
-
-            running_loss += (
-                loss.item()
-                * inputs.size(0)
+            train_running_loss += (
+                loss.item() * labels.size(0)
             )
 
-            predictions = outputs.argmax(
-                dim=1
-            )
+            predictions = outputs.argmax(dim=1)
 
-            correct += (
-                (predictions == labels)
-                .sum()
-                .item()
+            train_correct += (
+                (predictions == labels).sum().item()
             )
-
-            total += labels.size(0)
+            train_total += labels.size(0)
 
         train_loss = (
-            running_loss / total
+            train_running_loss / train_total
         )
-
         train_accuracy = (
-            correct / total
+            train_correct / train_total
         )
 
-        # ==============================================
+        # --------------------------------------------------
         # Validation
-        # ==============================================
-
-        model.eval()
-
-        val_running_loss = 0.0
-        val_correct = 0
-        val_total = 0
-
-        with torch.no_grad():
-
-            for inputs, labels in val_loader:
-
-                inputs = inputs.to(
-                    DEVICE,
-                    non_blocking=True,
-                )
-
-                labels = labels.to(
-                    DEVICE,
-                    non_blocking=True,
-                )
-
-                # Forward pass
-                outputs = model(inputs)
-
-                # Validation loss
-                loss = criterion(
-                    outputs,
-                    labels,
-                )
-
-                val_running_loss += (
-                    loss.item()
-                    * inputs.size(0)
-                )
-
-                # Predictions
-                predictions = outputs.argmax(
-                    dim=1
-                )
-
-                val_correct += (
-                    (predictions == labels)
-                    .sum()
-                    .item()
-                )
-
-                val_total += labels.size(0)
-
-        val_loss = (
-            val_running_loss / val_total
-        )
-
-        val_accuracy = (
-            val_correct / val_total
-        )
-
-        # --------------------------------------------------
-        # Store history
         # --------------------------------------------------
 
-        train_losses.append(
-            train_loss
+        (
+            val_loss,
+            val_accuracy,
+            val_f1,
+            _,
+            _,
+        ) = evaluate(model, val_loader, criterion)
+
+        improved = (
+            val_f1 > best_val_f1 + MIN_DELTA
         )
 
-        val_losses.append(
-            val_loss
-        )
-
-        train_accuracies.append(
-            train_accuracy
-        )
-
-        val_accuracies.append(
-            val_accuracy
-        )
-
-        # --------------------------------------------------
-        # Save best model
-        # --------------------------------------------------
-
-        if val_accuracy > best_val_accuracy:
-
+        if improved:
+            best_val_loss = val_loss
             best_val_accuracy = val_accuracy
-
-            os.makedirs(
-                "data/processed",
-                exist_ok=True,
-            )
+            best_val_f1 = val_f1
+            best_epoch = epoch + 1
+            epochs_without_improvement = 0
 
             torch.save(
                 model.state_dict(),
                 MODEL_PATH,
             )
 
-            saved = " ← BEST"
-
+            status = " <- BEST VAL LOSS"
         else:
+            epochs_without_improvement += 1
+            status = ""
 
-            saved = ""
-
-        # --------------------------------------------------
-        # Print epoch results
-        # --------------------------------------------------
+        # Record metrics for every epoch.
+        history.append({
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "train_accuracy": train_accuracy,
+            "val_loss": val_loss,
+            "val_accuracy": val_accuracy,
+            "val_macro_f1": val_f1,
+        })
 
         print(
-            f"Epoch "
-            f"{epoch + 1:02d}/{NUM_EPOCHS} | "
+            f"Epoch {epoch + 1:02d}/{NUM_EPOCHS} | "
             f"Train Loss: {train_loss:.4f} | "
             f"Train Acc: {train_accuracy:.4f} | "
             f"Val Loss: {val_loss:.4f} | "
-            f"Val Acc: {val_accuracy:.4f}"
-            f"{saved}"
+            f"Val Acc: {val_accuracy:.4f} | "
+            f"Val Macro F1: {val_f1:.4f}"
+            f"{status}"
         )
 
-    # ==================================================
-    # Load best model
-    # ==================================================
+        if epochs_without_improvement >= PATIENCE:
+            print(
+                f"\nEarly stopping triggered at "
+                f"epoch {epoch + 1}."
+            )
+            print(
+                f"Validation loss did not improve "
+                f"for {PATIENCE} consecutive epochs."
+            )
+            break
 
-    print("\n")
-    print("=" * 60)
+    # --------------------------------------------------
+    # Save history
+    # --------------------------------------------------
+
+    with open(
+        HISTORY_PATH,
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=history[0].keys(),
+        )
+        writer.writeheader()
+        writer.writerows(history)
+
+    # --------------------------------------------------
+    # Load best validation-loss checkpoint
+    # --------------------------------------------------
+
+    print("\n" + "=" * 60)
     print("Loading Best Model")
     print("=" * 60)
 
@@ -398,133 +358,99 @@ if __name__ == "__main__":
         )
     )
 
-    # ==================================================
-    # Test evaluation
-    # ==================================================
+    print(f"Best epoch: {best_epoch}")
+    print(f"Best validation loss: {best_val_loss:.4f}")
+    print(f"Validation accuracy at selected epoch: "
+          f"{best_val_accuracy:.4f}")
+    print(f"Validation macro F1 at selected epoch: "
+          f"{best_val_f1:.4f}")
 
-    model.eval()
+    # --------------------------------------------------
+    # Final test evaluation
+    # --------------------------------------------------
 
-    test_correct = 0
-    test_total = 0
+    print("\nEvaluating selected model on test set...")
 
-    all_predictions = []
-    all_labels = []
+    (
+        test_loss,
+        test_accuracy,
+        test_f1,
+        test_predictions,
+        test_labels,
+    ) = evaluate(model, test_loader, criterion)
 
-    with torch.no_grad():
+    print("\n" + "=" * 60)
+    print("Final Results")
+    print("=" * 60)
 
-        for inputs, labels in test_loader:
+    print(f"Selected epoch: {best_epoch}")
+    print(f"Test loss:      {test_loss:.4f}")
+    print(f"Test accuracy:  {test_accuracy:.4f}")
+    print(f"Test macro F1:  {test_f1:.4f}")
 
-            inputs = inputs.to(
-                DEVICE,
-                non_blocking=True,
-            )
+    print(f"\nCheckpoint saved to:\n{MODEL_PATH}")
+    print(f"Training history saved to:\n{HISTORY_PATH}")
 
-            labels = labels.to(
-                DEVICE,
-                non_blocking=True,
-            )
-
-            # Forward pass
-            outputs = model(inputs)
-
-            # Predictions
-            predictions = outputs.argmax(
-                dim=1
-            )
-
-            test_correct += (
-                (predictions == labels)
-                .sum()
-                .item()
-            )
-
-            test_total += labels.size(0)
-
-            all_predictions.extend(
-                predictions.cpu().numpy()
-            )
-
-            all_labels.extend(
-                labels.cpu().numpy()
-            )
-
-    test_accuracy = (
-        test_correct / test_total
-    )
-
-    # ==================================================
-    # Final results
-    # ==================================================
-
-    print(
-        f"\nBest Validation Accuracy: "
-        f"{best_val_accuracy:.4f}"
-    )
-
-    print(
-        f"Test Accuracy: "
-        f"{test_accuracy:.4f}"
-    )
-
-    print(
-        f"\nBest model saved to:"
-        f"\n{MODEL_PATH}"
-    )
-
-    # ==================================================
+    # --------------------------------------------------
     # Plot loss
-    # ==================================================
+    # --------------------------------------------------
+
+    epochs = [row["epoch"] for row in history]
 
     plt.figure(figsize=(10, 5))
-
     plt.plot(
-        train_losses,
+        epochs,
+        [row["train_loss"] for row in history],
         label="Training Loss",
     )
-
     plt.plot(
-        val_losses,
+        epochs,
+        [row["val_loss"] for row in history],
         label="Validation Loss",
     )
-
+    plt.axvline(
+        best_epoch,
+        linestyle="--",
+        label="Selected Epoch",
+    )
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
-
-    plt.title(
-        "CNN Training and Validation Loss"
-    )
-
+    plt.title("Depthwise CNN: Training and Validation Loss")
     plt.legend()
-
     plt.tight_layout()
-
+    plt.savefig(
+        "data/processed/loss_earlystop.png",
+        dpi=150,
+    )
     plt.show()
 
-    # ==================================================
+    # --------------------------------------------------
     # Plot accuracy
-    # ==================================================
+    # --------------------------------------------------
 
     plt.figure(figsize=(10, 5))
-
     plt.plot(
-        train_accuracies,
+        epochs,
+        [row["train_accuracy"] for row in history],
         label="Training Accuracy",
     )
-
     plt.plot(
-        val_accuracies,
+        epochs,
+        [row["val_accuracy"] for row in history],
         label="Validation Accuracy",
     )
-
+    plt.axvline(
+        best_epoch,
+        linestyle="--",
+        label="Selected Epoch",
+    )
     plt.xlabel("Epoch")
     plt.ylabel("Accuracy")
-
-    plt.title(
-        "CNN Training and Validation Accuracy"
-    )
-
+    plt.title("Depthwise CNN: Training and Validation Accuracy")
     plt.legend()
-
     plt.tight_layout()
-
+    plt.savefig(
+        "data/processed/accuracy_earlystop.png",
+        dpi=150,
+    )
     plt.show()
